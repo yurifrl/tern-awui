@@ -1,0 +1,12 @@
+{
+  "name": "tern-mobile",
+  "version": "0.1.0",
+  "description": "omp plugin: tern-awui mobile/web bridge — session relay for the Tern companion app.",
+  "type": "module",
+  "license": "MIT",
+  "omp": {
+    "extensions": [
+      "./tern-mobile.ts"
+    ]
+  }
+}
