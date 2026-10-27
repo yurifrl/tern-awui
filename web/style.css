@@ -26,19 +26,34 @@ a { color: inherit; text-decoration: none; }
 .screen { display: flex; flex-direction: column; height: 100dvh; padding-bottom: env(safe-area-inset-bottom); }
 .bar { display: flex; align-items: center; gap: 10px; padding: calc(10px + env(safe-area-inset-top)) 14px 10px; border-bottom: 1px solid var(--line); background: var(--panel); }
 .brand { font-weight: 650; letter-spacing: .02em; }
-/* The desktop brand doubles as the sidebar's minimize button: both labels share one grid cell, so the box keeps the word's size and only « shows on hover or keyboard focus. */
+/* The desktop brand doubles as the sidebar's minimize button: the word and « share one grid cell, so the
+   box keeps the word's size. On hover or keyboard focus the letters fold away to the left, last one first,
+   and « slides in after them, its leading chevron first; leaving plays it back in reverse. The rail's
+   expand button (.expand) runs it backwards: » rests there and, hovered, shoots off to the right while
+   "tern" unfolds from the left, first letter first. */
 .brand-toggle { display: inline-grid; padding: 0; border: 0; background: none; font-size: inherit; line-height: inherit; }
-.brand-toggle > span { grid-area: 1 / 1; text-align: center; }
-.brand-arrow { visibility: hidden; color: var(--accent); font-size: 18px; line-height: 1; align-self: center; }
-.brand-toggle:hover .brand-text, .brand-toggle:focus-visible .brand-text { visibility: hidden; }
-.brand-toggle:hover .brand-arrow, .brand-toggle:focus-visible .brand-arrow { visibility: visible; }
+.brand-toggle > * { grid-area: 1 / 1; }
+.brand-text > span { display: inline-block; transition: transform .2s cubic-bezier(.4,0,.2,1), opacity .16s; transition-delay: calc(90ms + var(--i) * 30ms); }
+.brand-arrow { width: 20px; height: 20px; align-self: center; justify-self: center; color: var(--accent); fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; overflow: visible; }
+.brand-arrow path { opacity: 0; transform: translateX(6px); transition: transform .22s cubic-bezier(.3,1.5,.5,1), opacity .15s; }
+.brand-arrow path + path { transition-delay: 40ms; }
+.brand-toggle:is(:hover, :focus-visible) .brand-text > span { opacity: 0; transform: translateX(-.7em) scaleX(.4); transition-delay: calc((3 - var(--i)) * 30ms); }
+.brand-toggle:is(:hover, :focus-visible) .brand-arrow path { opacity: 1; transform: none; transition-delay: 110ms; }
+.brand-toggle:is(:hover, :focus-visible) .brand-arrow path + path { transition-delay: 160ms; }
+.brand-toggle.expand .brand-text > span { opacity: 0; transform: translateX(-.7em) scaleX(.4); transition-delay: calc((3 - var(--i)) * 30ms); }
+.brand-toggle.expand .brand-arrow path { opacity: 1; transform: none; transition-delay: 160ms; }
+.brand-toggle.expand .brand-arrow path + path { transition-delay: 110ms; }
+.brand-toggle.expand:is(:hover, :focus-visible) .brand-text > span { opacity: 1; transform: none; transition-delay: calc(90ms + var(--i) * 30ms); }
+.brand-toggle.expand:is(:hover, :focus-visible) .brand-arrow path { opacity: 0; transform: translateX(6px); transition-delay: 40ms; }
+.brand-toggle.expand:is(:hover, :focus-visible) .brand-arrow path + path { transition-delay: 0s; }
+@media (prefers-reduced-motion: reduce) {
+  .brand-text > span, .brand-arrow path { transition: opacity .12s; transition-delay: 0s !important; transform: none !important; }
+}
 /* A subagent's prompt (written by its parent agent) renders as Markdown inside the prompt rail. */
 .msg.user.sub-prompt { white-space: normal; }
 .sub-prompt .user-text { flex: 1; }
 .sub-prompt .md > :first-child { margin-top: 0; }
 .sub-prompt .md > :last-child { margin-bottom: 0; }
-/* Header labels never break mid-label ("+ / omp"). */
-.bar .ghost { white-space: nowrap; }
 .bar .net { flex: none; }
 .spacer { flex: 1; }
 .muted { color: var(--muted); }
@@ -116,11 +131,17 @@ section h2 { display: flex; align-items: center; gap: 8px; margin: 0; padding: 1
 .user-text { min-width: 0; }
 /* omp's per-prompt actions, over the prompt's right end: on hover, or after a tap on touch screens. */
 .msg.user { position: relative; }
-.user-acts { position: absolute; top: 4px; right: 6px; display: none; gap: 2px; align-items: center; padding: 2px 4px 2px 8px; border-radius: 7px; background: var(--raise); border: 1px solid var(--line); font: 12px var(--mono); white-space: nowrap; }
-.user-acts button { border: 0; background: none; color: var(--muted); font: inherit; padding: 3px 7px; border-radius: 5px; }
-.user-acts button:hover { color: var(--fg); background: var(--panel); }
+.user-acts, .reply-acts { position: absolute; display: none; gap: 2px; align-items: center; padding: 2px 4px 2px 8px; border-radius: 7px; background: var(--raise); border: 1px solid var(--line); font: 12px var(--mono); white-space: nowrap; }
+.user-acts { top: 4px; right: 6px; }
+.user-acts button, .reply-acts button { border: 0; background: none; color: var(--muted); font: inherit; padding: 3px 7px; border-radius: 5px; }
+.user-acts button:hover, .reply-acts button:hover { color: var(--fg); background: var(--panel); }
 .msg.user.acts-open .user-acts { display: flex; }
 @media (hover: hover) { .msg.user:hover .user-acts { display: flex; } }
+/* A reply's Copy, the same way, over its bottom right end. */
+.reply { position: relative; }
+.reply-acts { bottom: -6px; right: 0; padding-left: 4px; }
+.reply.acts-open .reply-acts { display: flex; }
+@media (hover: hover) { .reply:hover .reply-acts { display: flex; } }
 .turn { font: 11px var(--mono); color: var(--muted); opacity: .55; text-align: right; padding-bottom: 10px; margin-bottom: 8px; border-bottom: 1px solid var(--line); }
 /* omp's idle recap, as the terminal prints it: ※ and italic, under the turn it sums up. */
 .chat-recap { display: flex; gap: 8px; align-items: baseline; margin: -2px 0 12px; color: var(--muted); font-style: italic; font-size: 14px; }
@@ -189,6 +210,19 @@ section h2 { display: flex; align-items: center; gap: 8px; margin: 0; padding: 1
 .primary:disabled { opacity: .45; }
 .working { color: var(--working); font-size: 12px; animation: blink 1.6s ease-in-out infinite; }
 @keyframes blink { 50% { opacity: .4; } }
+/* omp's working row: spinner, running time, and the current tool's intent swept by a highlight. */
+.working-row { display: flex; gap: 7px; align-items: baseline; min-width: 0; font: 12.5px var(--mono); color: var(--muted); white-space: nowrap; }
+.working-row .spinner { flex: none; width: 1em; color: var(--working); }
+.working-row .spinner::before { content: "⠋"; animation: spin-frames .8s steps(1) infinite; }
+.working-time { flex: none; font-variant-numeric: tabular-nums; }
+.working-intent { --base: color-mix(in srgb, var(--fg) 55%, var(--muted)); --hint: #62b8dc; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  background: linear-gradient(90deg, var(--base) 0 28%, var(--hint) 42% 58%, var(--base) 72% 100%) 100% 0 / 300% 100%;
+  -webkit-background-clip: text; background-clip: text; color: transparent; animation: shimmer 2.6s linear infinite; }
+@keyframes spin-frames { 0% { content: "⠋"; } 10% { content: "⠙"; } 20% { content: "⠹"; } 30% { content: "⠸"; } 40% { content: "⠼"; } 50% { content: "⠴"; } 60% { content: "⠦"; } 70% { content: "⠧"; } 80% { content: "⠇"; } 90% { content: "⠏"; } }
+@keyframes shimmer { to { background-position: 0 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .working-row .spinner::before, .working-intent { animation: none; }
+}
 .term { margin: 0; font: 11.5px/1.35 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 /* Syntax colors (highlight.js classes) for opened files and their fenced code. */
 .hljs-comment, .hljs-quote { color: #7d8590; font-style: italic; }
@@ -243,8 +277,19 @@ section h2 { display: flex; align-items: center; gap: 8px; margin: 0; padding: 1
 /* In a prompt the images come first, as Tern draws them, then the text. */
 .user-text > .thumbs:first-child { margin: 0 0 8px; }
 /* Opaque, in the app's own colour: a see-through backdrop let the chat show through the photo. */
-.lightbox { position: fixed; inset: 0; z-index: 20; background: var(--bg); display: grid; place-items: center; padding: 12px; }
-.lightbox img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.lightbox { position: fixed; inset: 0; z-index: 20; background: var(--bg); }
+/* One image per page; touch swipes snap page by page, desktop pages with ‹ › and the arrow keys. */
+.lightbox-strip { height: 100%; display: flex; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; overscroll-behavior: contain; scrollbar-width: none; }
+.lightbox-strip::-webkit-scrollbar { display: none; }
+.lightbox-page { flex: 0 0 100%; height: 100%; scroll-snap-align: center; scroll-snap-stop: always; display: grid; place-items: center; padding: 12px; }
+.lightbox-page img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.lightbox-nav { position: absolute; top: 50%; transform: translateY(-50%); width: 44px; height: 64px; border: 0; border-radius: 10px; background: var(--panel); color: var(--fg); font-size: 28px; opacity: .8; cursor: pointer; }
+.lightbox-nav.prev { left: 10px; }
+.lightbox-nav.next { right: 10px; }
+.lightbox-nav:disabled { opacity: .25; cursor: default; }
+.lightbox-count { position: absolute; left: 50%; bottom: max(12px, env(safe-area-inset-bottom)); transform: translateX(-50%); padding: 2px 10px; border-radius: 999px; background: var(--panel); color: var(--muted); font-size: 13px; pointer-events: none; }
+/* Touch screens swipe; the buttons would only cover the image. */
+@media (hover: none) { .lightbox-nav { display: none; } }
 .doc { font-size: 15px; }
 .term pre { margin: 0; font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; background: none !important; }
 .sheet.tall { max-height: 82dvh; }
@@ -257,25 +302,78 @@ section h2 { display: flex; align-items: center; gap: 8px; margin: 0; padding: 1
 .btw-history-turn { padding: 10px; overflow-wrap: anywhere; }
 .btw-history-turn + .btw-history-turn { border-top: 1px solid var(--line); }
 .age-blocked { color: var(--blocked); font-weight: 600; }
-.ghost.danger { color: var(--blocked); }
+.icon-btn.danger:hover, .icon-btn.danger:active { color: var(--blocked); background: color-mix(in srgb, var(--blocked) 14%, transparent); }
+.session-bar .icon-btn:not(.danger):active { background: var(--raise); }
+/* "+ omp": a plus and omp's π mark, borderless like the header icons. */
+.new-omp { display: inline-grid; place-items: center; height: 30px; padding: 0 8px; border: 0; border-radius: 8px; background: none; color: var(--muted); }
+.new-omp:active { background: var(--raise); color: var(--fg); }
+.new-omp:disabled { opacity: .5; }
+.new-omp .omp-logo { width: 25px; height: 12px; }
+.group-head .new-omp { height: 26px; }
+/* Hovered, π finishes its shaded foot and stomps it, and the stomp sets off a short wiggle. */
+.omp-logo, .omp-foot { transform-box: fill-box; transform-origin: center; }
+@media (hover: hover) and (prefers-reduced-motion: no-preference) {
+  .new-omp:hover:not(:disabled) { color: var(--fg); }
+  .omp-play:hover:not(:disabled) .omp-foot { animation: omp-kick .45s ease-out forwards; }
+  .omp-play:hover:not(:disabled) .omp-logo { animation: omp-wiggle .35s ease-in-out .3s; }
+}
+@keyframes omp-kick { 0% { opacity: .4; } 45% { opacity: 1; transform: none; } 70% { opacity: 1; transform: translateY(60%); } 100% { opacity: 1; transform: none; } }
+@keyframes omp-wiggle { 0%, 100% { transform: none; } 25% { transform: rotate(-6deg); } 50% { transform: rotate(5deg); } 75% { transform: rotate(-2deg); } }
+/* An omp session with nothing in it yet: omp's welcome mark, as its pane shows it in Tern. */
+.welcome { display: flex; align-items: center; justify-content: center; gap: 18px; padding: 40px 0 24px; color: var(--fg); user-select: none; }
+.welcome .omp-play { display: grid; }
+.welcome .omp-logo { width: 54px; height: 45px; }
+.welcome-name { font: 400 44px/1 var(--mono); letter-spacing: .01em; }
 .row-sub.recap { font-style: italic; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .toast { position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 30; padding: 9px 16px; border-radius: 999px; background: var(--raise); border: 1px solid var(--line); color: var(--fg); font-size: 14px; box-shadow: 0 4px 18px rgb(0 0 0 / .4); white-space: nowrap; }
 /* The gauge lies on the straight part of the top border: the border itself is the unused part,
    the fill paints over it, and the labels cut it like a fieldset legend. */
 .ctx { position: absolute; top: -0.5px; left: 18px; right: 18px; height: 0; display: flex; align-items: center; gap: 2px; pointer-events: none; }
 .ctx-scale { position: relative; flex: 1; align-self: stretch; }
-.ctx-fill { position: absolute; left: 0; top: -1px; height: 2px; border-radius: 1px; background: var(--accent); transition: width .3s; }
+/* The used part in omp's grey, brightening toward its end; red past the window. */
+.ctx-fill { position: absolute; left: 0; top: -1px; height: 2px; border-radius: 1px; background: linear-gradient(90deg, color-mix(in srgb, var(--fg) 22%, transparent), color-mix(in srgb, var(--fg) 62%, transparent)); transition: width .3s; }
 .ctx-label { font: 11px/1 var(--mono); padding: 0 4px; font-variant-numeric: tabular-nums; background: linear-gradient(var(--bg) 50%, var(--panel) 50%); }
-.ctx-pct { position: absolute; top: 0; transform: translateY(-50%); margin-left: 2px; color: var(--accent); transition: left .3s; }
+.ctx-pct { position: absolute; z-index: 1; top: 0; transform: translateY(-50%); margin-left: 2px; color: color-mix(in srgb, var(--fg) 70%, var(--muted)); transition: left .3s, color .25s ease-out; }
 .ctx-window { color: var(--muted); }
 .ctx-over .ctx-pct { color: var(--blocked); }
+.ctx-over .ctx-fill { background: var(--blocked); }
+/* Hovered or tapped, the used part lightens, as in omp: a brighter copy fades in over it
+   (gradients don't transition themselves). */
+.ctx-fill::after { content: ""; position: absolute; inset: 0; border-radius: inherit; opacity: 0; transition: opacity .25s ease-out;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--fg) 50%, transparent), var(--fg)); }
+.ctx-over .ctx-fill::after { background: color-mix(in srgb, var(--blocked) 65%, var(--fg)); }
+/* The remaining part is the composer's border; a lighter line fades in over it the same way. */
+.ctx-scale::before { content: ""; position: absolute; left: 0; right: 0; top: -0.5px; height: 1px; opacity: 0; transition: opacity .25s ease-out; background: color-mix(in srgb, var(--fg) 28%, transparent); }
+.ctx.tip-open .ctx-fill::after, .ctx.tip-open .ctx-scale::before { opacity: 1; }
+.ctx.tip-open:not(.ctx-over) .ctx-pct { color: var(--fg); }
+@media (hover: hover) {
+  .ctx-hit:hover ~ .ctx-scale .ctx-fill::after, .ctx-hit:hover ~ .ctx-scale::before { opacity: 1; }
+  .ctx:not(.ctx-over) .ctx-hit:hover ~ .ctx-scale .ctx-pct { color: var(--fg); }
+}
 .hints { display: flex; flex-direction: column; max-height: 38dvh; overflow-y: auto; margin-bottom: 8px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
 .hint { display: flex; flex-direction: column; gap: 1px; padding: 8px 12px; border: 0; border-bottom: 1px solid var(--line); background: none; text-align: left; }
 .hint:last-child { border-bottom: 0; }
 .hint:active { background: var(--raise); }
 .hint-label { font: 13.5px var(--mono); color: var(--fg); }
 .hint-desc { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.ctx-mark { position: absolute; top: -4px; width: 2px; height: 7px; margin-left: -1px; border-radius: 1px; background: color-mix(in srgb, var(--accent) 55%, var(--muted)); }
+/* Where auto-compaction fires: a fine, faint tick, as omp draws it. */
+.ctx-mark { position: absolute; top: -1.5px; width: 1px; height: 3px; margin-left: -.5px; background: color-mix(in srgb, var(--fg) 40%, transparent); }
+/* While the agent works, a soft glint runs along the gauge from its 0 point, as in omp. */
+.ctx-glint { position: absolute; left: 0; right: 0; top: -1px; height: 2px; overflow: hidden; pointer-events: none; }
+.ctx-glint::after { content: ""; position: absolute; inset: 0 auto 0 0; width: 22%;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--fg) 55%, transparent), transparent); animation: ctx-glint 2.8s ease-in-out infinite; }
+@keyframes ctx-glint { from { transform: translateX(-100%); } to { transform: translateX(455%); } }
+@media (prefers-reduced-motion: reduce) { .ctx-glint { display: none; } }
+/* The gauge's hover/tap target: a thin strip over the border (the gauge itself takes no pointer). */
+.ctx-hit { position: absolute; left: 0; right: 0; top: -10px; height: 16px; padding: 0; border: 0; background: none; pointer-events: auto; cursor: default; }
+/* Its details, as omp shows them: fade in after 600 ms of hover, or at once on a tap. */
+.ctx-tip { position: absolute; bottom: 12px; z-index: 6; display: flex; flex-direction: column; gap: 2px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--raise); box-shadow: 0 4px 16px rgb(0 0 0 / .4); color: var(--muted); font-size: 13px; line-height: 1.35; white-space: nowrap;
+  opacity: 0; visibility: hidden; transform: translate(-50%, 4px); transition: opacity .15s, transform .15s, visibility 0s .15s; }
+.ctx-tip strong { color: var(--fg); font-weight: 600; }
+.ctx.tip-open .ctx-tip { opacity: 1; visibility: visible; transform: translate(-50%, 0); transition: opacity .15s, transform .15s; }
+@media (hover: hover) {
+  .ctx-hit:hover ~ .ctx-tip { opacity: 1; visibility: visible; transform: translate(-50%, 0); transition: opacity .15s .6s, transform .15s .6s, visibility 0s .6s; }
+}
 .send.stop { background: var(--fg); color: var(--bg); }
 .btw { margin-bottom: 8px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--line)); border-radius: 12px; background: var(--panel); max-height: 40dvh; overflow-y: auto; font-size: 14px; }
 .btw-head { display: flex; gap: 8px; align-items: baseline; margin-bottom: 6px; }
@@ -336,8 +434,7 @@ section h2 { display: flex; align-items: center; gap: 8px; margin: 0; padding: 1
   .desk-main .ext-session { margin-inline: max(12px, calc((100% - var(--reading-width)) / 2)); }
   /* The sidebar minimized to a rail (Ctrl+\): one icon per session, ringed in its status colour. */
   .desk.rail { grid-template-columns: 56px 1fr; }
-  .rail-toggle { flex: none; font-size: 18px; line-height: 1; color: var(--muted); }
-  .rail-toggle:hover { color: var(--fg); background: var(--raise); }
+  .rail-head .brand-toggle { flex: none; padding: 6px 2px; }
   .side-rail { align-items: center; padding-bottom: 8px; }
   .rail-head { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 8px 0; width: 100%; border-bottom: 1px solid var(--line); background: var(--panel); }
   .rail-list { width: 100%; display: flex; flex-direction: column; align-items: center; scrollbar-width: none; padding-bottom: 8px; }
@@ -448,7 +545,6 @@ a.job:hover, .subagents-link:hover { background: var(--raise); }
 .list-bar .icon-btn { width: 30px; height: 30px; }
 .list-bar .icon-btn.hide-old { width: auto; }
 .list-bar .icon-btn svg { width: 16px; height: 16px; }
-.list-bar .ghost { font-size: 12.5px; padding: 3px 9px; }
 
 /* The extension doesn't match the server: a banner on the list, a notice under a session's header,
    a chip in the list header counting such sessions and a mark on their rows. */

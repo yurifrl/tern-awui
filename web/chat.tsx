@@ -1,6 +1,6 @@
 // The chat renderer, shared by sessions and their subagents: markdown (charts, mermaid), advisor
 // notes, tool lines, ask cards and prompts.
-import { createContext } from "preact";
+import { createContext, type ComponentChildren } from "preact";
 import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import type { Mermaid } from "mermaid";
 import { drawCharts } from "./charts";
@@ -8,7 +8,7 @@ import { post, type AdvisorNote, type Ask, type ChatEntry, type Img, type TodoPh
 import { askAnswers, askReady, clock, duration, langOf, parseAdvisorNote, prettyModel, type AskPick } from "./lib";
 import { renderMarkdown } from "./markdown";
 import { highlightFences } from "./highlight";
-import { buzz, Thumbs, Todo, UserMsg } from "./parts";
+import { buzz, CopyButton, Thumbs, Todo, UserMsg } from "./parts";
 import {
   DEEPEN,
   isLinkable,
@@ -83,7 +83,9 @@ export function Markdown({
   onClick?: (e: MouseEvent) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
-  const html = useMemo(() => renderMarkdown(text, imageSources), [text, imageSources]);
+  // Each `chat` event parses a fresh `imageSources` object: compare its content, not its identity.
+  const sources = imageSources && JSON.stringify(imageSources);
+  const html = useMemo(() => renderMarkdown(text, imageSources), [text, sources]);
   const lang = useMemo(() => langOf(text), [text]);
   useEffect(() => {
     if (!ref.current) return;
@@ -126,8 +128,40 @@ function Reply({ entry }: { entry: Extract<ChatEntry, { role: "assistant" }> }) 
   const source = useMemo(() => (answers.length ? withAnswers(entry.text, answers) : entry.text), [entry.text, answers]);
   const parts = useMemo(() => (source.includes("{{") ? parse(source) : null), [source]);
   const all = useMemo(() => (parts ? stretches(parts) : []), [parts]);
-  if (!parts || !all.some(isLinkable)) return <Markdown class="msg assistant md" text={entry.text} imageSources={entry.imageSources} />;
-  return <StretchReply entry={entry} parts={parts} all={all} />;
+  // Copy takes the whole reply: every stretch drawn open, without its markup.
+  const copyText = useMemo(() => (parts ? writeOpen(parts) : source), [parts, source]);
+  return (
+    <ReplyActs text={copyText}>
+      {!parts || !all.some(isLinkable) ? (
+        <Markdown class="msg assistant md" text={entry.text} imageSources={entry.imageSources} />
+      ) : (
+        <StretchReply entry={entry} parts={parts} all={all} />
+      )}
+    </ReplyActs>
+  );
+}
+
+/**
+ * A reply with its Copy action, over its bottom right end: on hover, or after a tap on touch
+ * screens. Taps on links (stretches open there) and ones ending a text selection don't toggle it.
+ */
+function ReplyActs({ text, children }: { text: string; children: ComponentChildren }) {
+  const [open, setOpen] = useState(false);
+  const onClick = (e: MouseEvent) => {
+    if ((e.target as Element | null)?.closest?.("a, button, img")) return;
+    if (getSelection()?.toString()) return;
+    setOpen(!open);
+  };
+  return (
+    <div class={`reply${open ? " acts-open" : ""}`} onClick={onClick}>
+      {children}
+      {text && (
+        <div class="reply-acts" onClick={(ev) => ev.stopPropagation()}>
+          <CopyButton text={text} />
+        </div>
+      )}
+    </div>
+  );
 }
 
 function StretchReply({ entry, parts, all }: { entry: Extract<ChatEntry, { role: "assistant" }>; parts: Segment[]; all: Stretch[] }) {
@@ -264,7 +298,19 @@ function RuleCard({ rules }: { rules: { name: string; text: string }[] }) {
   );
 }
 
-function Tools({ calls, images, todo, latestTodo }: { calls: ToolCall[]; images: Img[]; todo: TodoPhase[] | null; latestTodo: boolean }) {
+function Tools({
+  calls,
+  images,
+  gallery,
+  todo,
+  latestTodo,
+}: {
+  calls: ToolCall[];
+  images: Img[];
+  gallery: Img[];
+  todo: TodoPhase[] | null;
+  latestTodo: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const errors = calls.filter((c) => c.error).length;
   const last = calls[calls.length - 1];
@@ -287,7 +333,7 @@ function Tools({ calls, images, todo, latestTodo }: { calls: ToolCall[]; images:
           ))}
         </ul>
       )}
-      {images.length > 0 && <Thumbs images={images} />}
+      {images.length > 0 && <Thumbs images={images} gallery={gallery} />}
       {todo && <Todo phases={todo} full={latestTodo} />}
     </div>
   );
@@ -421,6 +467,16 @@ export function Chat({ entries, block, rewind, readOnly = false }: { entries: Ch
   // An ask is open only while nothing was said after it.
   const lastTalk = entries.findLastIndex((e) => e.role === "user" || e.role === "assistant");
   const latestTodo = entries.findLastIndex((e) => e.role === "tools" && e.todo !== null);
+  // Every image of a turn (a prompt and the screenshots after it), so the full-screen view pages
+  // through them all. A turn's entries share one array, still filling as the walk goes on.
+  const galleries = useMemo(() => {
+    let turn: Img[] = [];
+    return entries.map((e) => {
+      if (e.role === "user") turn = [];
+      if (e.role === "user" || e.role === "tools") turn.push(...e.images);
+      return turn;
+    });
+  }, [entries]);
   return (
     <>
       {entries.map((e, n) => {
@@ -431,12 +487,12 @@ export function Chat({ entries, block, rewind, readOnly = false }: { entries: Ch
             <div key={n} class="msg user sub-prompt">
               <span class="user-mark">›</span>
               <div class="user-text">
-                {e.images.length > 0 && <Thumbs images={e.images} />}
+                {e.images.length > 0 && <Thumbs images={e.images} gallery={galleries[n]} />}
                 <Markdown class="md" text={openText(e.text)} />
               </div>
             </div>
           ) : (
-            <UserMsg key={n} entry={e} block={block} rewind={rewind} />
+            <UserMsg key={n} entry={e} block={block} rewind={rewind} gallery={galleries[n]} />
           );
         if (e.role === "turn")
           return (
@@ -457,7 +513,7 @@ export function Chat({ entries, block, rewind, readOnly = false }: { entries: Ch
             </div>
           );
         if (e.role === "tools")
-          return <Tools key={n} calls={e.calls} images={e.images} todo={e.todo} latestTodo={n === latestTodo} />;
+          return <Tools key={n} calls={e.calls} images={e.images} gallery={galleries[n]} todo={e.todo} latestTodo={n === latestTodo} />;
         return <AskCard key={e.id} ask={e} block={block} pending={!readOnly && n > lastTalk} />;
       })}
     </>

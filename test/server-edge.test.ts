@@ -248,6 +248,32 @@ describe("static app", () => {
     expect(escape.status).toBe(400);
     expect(await escape.text()).toBe("bad path");
   });
+
+  test("brotli when the browser takes it, chunks immutable, the rest revalidated by build id", async () => {
+    const get = (path: string, extra: Record<string, string> = {}) =>
+      fetch(s.base + path, { headers: { ...s.headers, ...extra }, decompress: false } as RequestInit);
+    writeFileSync(`${dist}/app.js.br`, Bun.deflateSync("x"));
+    writeFileSync(`${dist}/chunk-abc123.js`, "export {}");
+    writeFileSync(`${dist}/build-id`, "0123456789abcdef");
+    const plain = await get("/app.js");
+    expect(plain.headers.get("content-encoding")).toBeNull();
+    expect(plain.headers.get("etag")).toBe('"0123456789abcdef"');
+    const br = await get("/app.js", { "accept-encoding": "gzip, br" });
+    expect(br.headers.get("content-encoding")).toBe("br");
+    expect(br.headers.get("vary")).toBe("accept-encoding");
+    expect(br.headers.get("content-type")).toContain("javascript");
+    expect(br.headers.get("etag")).toBe('"0123456789abcdef-br"');
+    const again = await get("/app.js", { "accept-encoding": "br", "if-none-match": '"0123456789abcdef-br"' });
+    expect(again.status).toBe(304);
+    // A new build changes the id: the old tag no longer matches.
+    writeFileSync(`${dist}/build-id`, "fedcba9876543210");
+    expect((await get("/app.js", { "accept-encoding": "br", "if-none-match": '"0123456789abcdef-br"' })).status).toBe(200);
+    const chunk = await get("/chunk-abc123.js");
+    expect(chunk.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+    expect(chunk.headers.get("etag")).toBeNull();
+    // No .br beside it: the plain file, even when brotli is accepted.
+    expect((await get("/chunk-abc123.js", { "accept-encoding": "br" })).headers.get("content-encoding")).toBeNull();
+  });
 });
 
 describe("web push", () => {
@@ -643,7 +669,7 @@ test("bridge errors reach every command response and never submit a rejected dra
   }
 });
 
-test("a replacement bridge clears the previous live text and queue and ignores its late side answers", async () => {
+test("a replacement bridge clears the previous live text, queue and run, and ignores its late side answers", async () => {
   const s = new Sandbox();
   try {
     await s.start();
@@ -653,16 +679,20 @@ test("a replacement bridge clears the previous live text and queue and ignores i
     const events = new Events();
     await events.open(s, "?block=1");
     await events.take("chat");
+    expect(await events.take("run")).toBeNull();
     await old.take("watch");
     old.send({ t: "live", text: "old live", done: false });
     await events.take("live", (data) => obj(data).text === "old live");
-    old.report({ queued: ["old queued"] });
+    old.report({ queued: ["old queued"], status: "working", run: { since: 1000, intent: "old intent" } });
     await events.take("queued", (data) => arr(data).length === 1);
+    await events.take("run", (data) => obj(data).intent === "old intent");
     const fresh = new Extension(s, "1", "test/replacement");
     await fresh.connect();
     await events.take("state", (state) => obj(item(state, 1).live).model === "test/replacement");
     expect(await events.take("live")).toEqual({ text: "", done: false });
     expect(await events.take("queued")).toEqual([]);
+    // The replacement reports no run (an older extension): the open page must not keep the old one.
+    expect(await events.take("run")).toBeNull();
     expect((await old.take("watch")).on).toBe(false);
     expect((await fresh.take("watch")).on).toBe(true);
     old.send({ t: "btw", id: "previous-question", text: "stale answer", done: true });

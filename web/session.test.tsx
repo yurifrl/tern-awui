@@ -71,7 +71,13 @@ test("session header, transcript, live text and queued steer/follow-up marks", a
   expect(root.querySelector(".live strong")!.textContent).toBe("Writing now");
   expect([...root.querySelectorAll(".queued-mark")].map((e) => e.textContent)).toEqual(["↳", "→"]);
   expect([...root.querySelectorAll(".queued")].map((e) => e.getAttribute("title"))).toEqual(["Steers the running turn", "Sent once the running turn ends"]);
-  expect(root.querySelector(".working")!.textContent).toMatch(/^working · \d+s$/);
+  // Without the turn's report (older extension) it counts from the status change.
+  expect(root.querySelector(".working-row")!.textContent).toMatch(/^2\d\.\ds·Working…$/);
+  await emit("run", { since: Date.now() - 125_000, intent: "Running full suite" });
+  expect(root.querySelector(".working-time")!.textContent).toMatch(/^2m 0\ds$/);
+  expect(root.querySelector(".working-intent")!.textContent).toBe("Running full suite");
+  await emit("run", { since: Date.now() - 3_000, intent: "" });
+  expect(root.querySelector(".working-intent")!.textContent).toBe("Working…");
   await emit("live", { text: "Writing now", done: true });
   expect(root.querySelector(".live")).not.toBeNull();
   await emit("chat", { entries: [{ role: "assistant", text: "Writing now", ts: 2 }] });
@@ -213,6 +219,20 @@ test("scrolling away preserves position when a transcript update arrives", async
   await act(() => void scroll.dispatchEvent(new Event("scroll")));
   await emit("chat", { entries: [{ role: "assistant", text: "keep bottom pinned", ts: 2 }] });
   expect(scroll.scrollTop).toBe(1000);
+});
+
+test("an empty omp session shows omp's welcome mark until its first entry", async () => {
+  await open(item({ status: "idle" }));
+  await emit("chat", { entries: [] });
+  expect(root.querySelector(".welcome")!.textContent).toBe("omp");
+  expect(root.querySelector(".welcome .omp-foot")).not.toBeNull();
+  // A turn already running (or streaming) isn't an empty session.
+  await emit("live", { text: "Starting", done: false });
+  expect(root.querySelector(".welcome")).toBeNull();
+  await emit("live", { text: "", done: true });
+  await emit("chat", { entries: [{ role: "user", id: "u1", text: "hi", images: [], ts: 1 }] });
+  expect(root.querySelector(".welcome")).toBeNull();
+  expect(root.querySelector(".msg.user")!.textContent).toContain("hi");
 });
 
 test("subagent list and read-only transcript subscribe to their distinct streams", async () => {

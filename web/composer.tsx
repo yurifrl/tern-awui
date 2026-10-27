@@ -1,7 +1,7 @@
 // The prompt: draft mirroring, sends and follow-ups, side questions, pasted images, completions,
 // terminal typing and the key bar.
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { post, postJson, type Btw, type BtwHistoryRecord, type Item, type Role } from "./api";
+import { post, postJson, type Btw, type BtwHistoryRecord, type ContextUse, type Item, type Role } from "./api";
 import { btwCommand, can, composerKey, currentRole, fitEdge, lineEdit, needsReencode, prettyModel, tokensShort } from "./lib";
 import { Markdown } from "./chat";
 import { openText } from "./stretch";
@@ -61,6 +61,7 @@ export function Composer({
   raw,
   btw,
   setBtw,
+  context = null,
 }: {
   block: string;
   item: Item | undefined;
@@ -70,6 +71,8 @@ export function Composer({
   /** The open side question (`/btw …`) and its streaming answer. */
   btw: Btw | null;
   setBtw: (b: Btw | null) => void;
+  /** The context gauge, from the stream's `context` event; none without one. */
+  context?: ContextUse | null;
 }) {
   const [text, setText] = useState("");
   /** The composer text now, for async work that must not act on an older value. */
@@ -163,8 +166,19 @@ export function Composer({
     remote.current = null;
     setText((t) => (t === wanted ? t : wanted));
   }
+  // A prompt typed before omp's editor connected (still loading or starting) becomes its draft,
+  // rather than giving way to the editor's empty one.
+  const typedOffline = useRef(false);
   useEffect(() => {
     if (!draft?.live) return;
+    if (typedOffline.current) {
+      typedOffline.current = false;
+      if (textRef.current !== "") {
+        lastEdit.current = Date.now();
+        void pushDraft(textRef.current);
+        return;
+      }
+    }
     remote.current = draft.text;
     reconcile();
   }, [draft]);
@@ -218,7 +232,11 @@ export function Composer({
   }
 
   const a = item?.agent;
-  const terminal = !!item && !a && !item.live;
+  // omp still starting: its prompt can be written but not sent, and it is no shell to type into.
+  const starting = !!item?.starting;
+  const terminal = !!item && !a && !item.live && !starting;
+  // Nothing to send to until the pane is known and its omp is up.
+  const unready = !item || starting;
 
   /** Runs terminal writes in order, so keystrokes never overtake each other. */
   function queue(path: string, body: unknown): Promise<string | null> {
@@ -245,6 +263,7 @@ export function Composer({
   /** `followUp`: omp holds the prompt until the running turn ends (its Ctrl+Q), rather than steering. */
   async function submit(e: Event, followUp = false) {
     e.preventDefault();
+    if (unready) return;
     if (terminal) {
       buzz();
       await terminalKeys(["Enter"]);
@@ -389,7 +408,6 @@ export function Composer({
   const empty = text.trim() === "" && !pasted.length;
   // While the agent runs and nothing is typed, the send button stops the turn instead.
   const stoppable = working && empty && !terminal && !!a;
-  const context = item?.live?.context ?? null;
 
   return (
     <div class="composer-wrap">
@@ -448,22 +466,7 @@ export function Composer({
         </div>
       )}
       <form class="composer" onSubmit={submit}>
-        {context && (
-          // Context-window use drawn as the composer's top border, like omp's own composer:
-          // the used part in accent, the percent riding just past it, the window at the right end.
-          <div class={`ctx${context.percent > 100 ? " ctx-over" : ""}`} title={`${context.percent}% of the context window · ${tokensShort(context.tokens)} tokens`}>
-            <div class="ctx-scale">
-              <div class="ctx-fill" style={{ width: `${Math.max(1, Math.min(context.percent, 100))}%` }} />
-              {context.compactAt !== null && (
-                <span class="ctx-mark" style={{ left: `${context.compactAt}%` }} title={`auto-compacts at ${Math.round(context.compactAt)}%`} />
-              )}
-              <span class="ctx-label ctx-pct" style={{ left: `min(${Math.min(context.percent, 100)}%, calc(100% - 4.5ch))` }}>
-                {context.percent}%
-              </span>
-            </div>
-            <span class="ctx-label ctx-window">{tokensShort(context.window)}</span>
-          </div>
-        )}
+        {context && <ContextGauge context={context} working={working} />}
         {pasted.length > 0 && (
           <div class="pasted">
             {pasted.map((p, i) => (
@@ -480,7 +483,7 @@ export function Composer({
           ref={area}
           rows={1}
           placeholder={
-            terminal ? "Type into the terminal" : working ? "Steer the agent…" : "Ask for changes or send a follow-up"
+            starting ? "omp is starting… write your prompt" : terminal ? "Type into the terminal" : working ? "Steer the agent…" : "Ask for changes or send a follow-up"
           }
           autoCapitalize={terminal ? "off" : undefined}
           autoCorrect={terminal ? "off" : undefined}
@@ -501,6 +504,7 @@ export function Composer({
             textRef.current = value;
             setText(value);
             if (live) void pushDraft(value);
+            else typedOffline.current = true;
           }}
           onPaste={terminal || !a ? undefined : onPaste}
           onKeyDown={(e) => {
@@ -563,7 +567,7 @@ export function Composer({
               </svg>
             </button>
           ) : (
-            <button class={`send${empty && !terminal ? " idle" : ""}`} type="submit" disabled={sending} aria-label="Send">
+            <button class={`send${empty && !terminal ? " idle" : ""}`} type="submit" disabled={sending || unready} aria-label="Send">
               <svg viewBox="0 0 20 20" aria-hidden="true">
                 <path d="M10 15.5v-11M5.5 9 10 4.5 14.5 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
               </svg>
@@ -588,6 +592,62 @@ export function Composer({
           }}
         />
       )}
+    </div>
+  );
+}
+
+/** How long a tapped gauge keeps its details open. */
+const TIP_MS = 3000;
+
+/**
+ * Context-window use drawn as the composer's top border, like omp's own composer: the used part in
+ * accent, the percent riding just past it, a tick where auto-compaction fires, the window at the
+ * right end. Its details (use, tokens, compaction threshold) fade in on hover after 600 ms, as in
+ * omp, or at once on a tap, closing after 3 s; either way above the pointer. While the agent works,
+ * a glint runs along the border, as in omp.
+ */
+function ContextGauge({ context, working }: { context: ContextUse; working: boolean }) {
+  const [tip, setTip] = useState(false);
+  useEffect(() => {
+    if (!tip) return;
+    const t = setTimeout(() => setTip(false), TIP_MS);
+    return () => clearTimeout(t);
+  }, [tip]);
+  const fill = Math.min(context.percent, 100);
+  const big = (n: number) => tokensShort(n).toUpperCase();
+  // The card follows the pointer through a CSS variable set on the gauge, outside the rendered
+  // style, so a context update doesn't move it back; keyboard focus places it over the fill's end.
+  const follow = (e: PointerEvent) => {
+    const gauge = (e.currentTarget as HTMLElement).parentElement!;
+    gauge.style.setProperty("--tip-x", `${e.clientX - gauge.getBoundingClientRect().left}px`);
+  };
+  return (
+    <div class={`ctx${context.percent > 100 ? " ctx-over" : ""}${tip ? " tip-open" : ""}`}>
+      <button
+        type="button"
+        class="ctx-hit"
+        aria-label="Context window details"
+        aria-expanded={tip}
+        onPointerMove={follow}
+        onPointerDown={follow}
+        onClick={() => setTip((t) => !t)}
+      />
+      <div class="ctx-scale">
+        <div class="ctx-fill" style={{ width: `${Math.max(1, fill)}%` }} />
+        {working && <span class="ctx-glint" />}
+        {context.compactAt !== null && <span class="ctx-mark" style={{ left: `${context.compactAt}%` }} />}
+        <span class="ctx-label ctx-pct" style={{ left: `min(${fill}%, calc(100% - 4.5ch))` }}>
+          {context.percent}%
+        </span>
+      </div>
+      <span class="ctx-label ctx-window">{big(context.window)}</span>
+      <div class="ctx-tip" role="tooltip" style={{ left: `clamp(90px, var(--tip-x, ${fill}%), calc(100% - 90px))` }}>
+        <strong>Context {context.percent}% used</strong>
+        <span>
+          {big(context.tokens)} of {big(context.window)} tokens
+        </span>
+        {context.compactAt !== null && <span>Auto-compact at {Math.round(context.compactAt)}%</span>}
+      </div>
     </div>
   );
 }

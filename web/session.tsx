@@ -1,12 +1,12 @@
 // An open session (chat, raw screen or note, with the composer) and its subagent screens.
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { highlightFile } from "./highlight";
-import { post } from "./api";
-import { age, backStep, can, isNote, type Route } from "./lib";
+import { post, type Run } from "./api";
+import { age, backStep, can, elapsed, isNote, type Route } from "./lib";
 import { Chat, Markdown, StretchContext, type StretchSync } from "./chat";
 import { liveText, withOpen } from "./stretch";
 import { screenHtml } from "./markdown";
-import { Dot } from "./parts";
+import { Dot, PiMark } from "./parts";
 import { ExtensionNotice } from "./extension";
 import { JobsStrip, SubagentChat, SubagentList } from "./subagents";
 import { Title } from "./home";
@@ -16,7 +16,7 @@ import { goBack, origins, useNow, useStream, type View } from "./hooks";
 export function Session({ block }: { block: string }) {
   const [view, setView] = useState<View>("chat");
   // The server answers a chat request for a non-omp block with its screen.
-  const { state, chat, live, queued, btw, setBtw, screen, draft, doc, online, stretch } = useStream(block, view);
+  const { state, chat, live, queued, run, context, btw, setBtw, screen, draft, doc, online, stretch } = useStream(block, view);
   // Open stretches: the omp session's (stretch.ts) when it reports them, else this page's own.
   const [opened, setOpened] = useState<Record<string, string[]>>({});
   // Whether `opened` mirrors the pane: then losing the report (omp restarted without stretch.ts) drops
@@ -58,6 +58,32 @@ export function Session({ block }: { block: string }) {
     const el = scroller.current;
     if (el && pinned.current) el.scrollTop = el.scrollHeight;
   }, [chat, live, queued, screen, view]);
+  // Anything else that grows the bottom (the working row, subagent jobs, images loading, an
+  // answer card) keeps a reader at the bottom there too: each child's size is watched, and the
+  // watch follows children coming and going. A prompt jump in flight is left to finish.
+  useEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    const follow = () => {
+      if (pinned.current && !gliding(glide.current, el)) el.scrollTop = el.scrollHeight;
+    };
+    const sizes = new ResizeObserver(follow);
+    const watch = () => {
+      sizes.disconnect();
+      sizes.observe(el);
+      for (const child of el.children) sizes.observe(child);
+    };
+    const children = new MutationObserver(() => {
+      watch();
+      follow();
+    });
+    watch();
+    children.observe(el, { childList: true });
+    return () => {
+      sizes.disconnect();
+      children.disconnect();
+    };
+  }, []);
 
   const shownState = item?.status ?? undefined;
   const working = shownState === "working";
@@ -89,12 +115,16 @@ export function Session({ block }: { block: string }) {
             {!online && <span class="c-blocked">offline</span>}
           </div>
         </div>
-        <button class="ghost" title="Show this pane on the desktop" onClick={() => post(`/api/blocks/${block}/focus`, {})}>
-          ⌖
+        <button class="icon-btn" title="Show this pane on the desktop" aria-label="Show this pane on the desktop" onClick={() => post(`/api/blocks/${block}/focus`, {})}>
+          {/* A monitor with an arrow out of its corner, like an "open elsewhere" link: show this pane at the desk. */}
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M10.5 3.5H4.3a1.8 1.8 0 0 0-1.8 1.8v6.4a1.8 1.8 0 0 0 1.8 1.8h11.4a1.8 1.8 0 0 0 1.8-1.8V9.5M7 17h6M10 13.5V17" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
+            <path d="M8 10.5 15.5 3M11.5 3h4v4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
         </button>
         {item && (
           <button
-            class="ghost danger"
+            class="icon-btn danger"
             title="Close this block"
             aria-label="Close this block"
             onClick={async () => {
@@ -106,7 +136,9 @@ export function Session({ block }: { block: string }) {
               else if (location.hash === `#/b/${block}`) goBack({ view: "session", block });
             }}
           >
-            ✕
+            <svg viewBox="0 0 20 20" aria-hidden="true">
+              <path d="M5.5 5.5l9 9M14.5 5.5l-9 9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+            </svg>
           </button>
         )}
       </header>
@@ -144,7 +176,16 @@ export function Session({ block }: { block: string }) {
           ) : chat && view === "chat" ? (
             <>
               <StretchContext.Provider value={stretchSync}>
-                <Chat entries={chat} block={block} rewind={can(item?.live, "rewind")} />
+                {chat.length || live || queued.length || working ? (
+                  <Chat entries={chat} block={block} rewind={can(item?.live, "rewind")} />
+                ) : (
+                  <div class="welcome">
+                    <span class="omp-play">
+                      <PiMark />
+                    </span>
+                    <span class="welcome-name">omp</span>
+                  </div>
+                )}
               </StretchContext.Provider>
               {live && <Markdown class="msg assistant md live" mermaid={false} text={liveText(live)} />}
               {queued.map((q, i) => (
@@ -165,7 +206,7 @@ export function Session({ block }: { block: string }) {
             <div class="empty">Loading…</div>
           )}
           {doc?.clipped && <div class="muted small">Showing the first 512 KB.</div>}
-          {working && <div class="working">working · {item ? age(item.since, now) : ""}</div>}
+          {working && item && <WorkingRow run={run} since={item.since} />}
           {item && <JobsStrip block={block} jobs={item.live?.jobs ?? []} subagents={item.agent?.subagents ?? 0} now={now} />}
         </div>
         {!item?.doc && chat && view === "chat" && (
@@ -192,8 +233,28 @@ export function Session({ block }: { block: string }) {
           btw={btw}
           setBtw={setBtw}
           raw={isOmp ? { on: view === "screen", toggle: () => setView(view === "screen" ? "chat" : "screen") } : undefined}
+          context={context}
         />
       )}
+    </div>
+  );
+}
+
+/**
+ * omp's working row: a spinner, the turn's running time and what its current tool call is doing,
+ * swept by a highlight. Without the turn's report (older extension) it counts from the status change.
+ */
+function WorkingRow({ run, since }: { run: Run | null; since: number }) {
+  const start = run?.since ?? since;
+  // Tenths tick under a minute, as in omp; whole seconds after.
+  const now = useNow(Date.now() - start < 60_000 ? 100 : 1000);
+  return (
+    // No live region: a clock ticking ten times a second would flood screen readers.
+    <div class="working-row">
+      <span class="spinner" aria-hidden="true" />
+      <span class="working-time">{elapsed(now - start)}</span>
+      <span aria-hidden="true">·</span>
+      <span class="working-intent">{run?.intent || "Working…"}</span>
     </div>
   );
 }

@@ -896,6 +896,33 @@ describe("terminal typing and key bar", () => {
     expect(root.querySelector(".keys")).toBeNull();
   });
 
+  test("a starting omp hides the key bar and holds its prompt until it connects, then hands it over as the draft", async () => {
+    await show({ item: item({ agent: null, live: null, status: null, starting: true }), draft: { live: false, text: "" } });
+    expect(root.querySelector(".keys")).toBeNull();
+    await input("fix the login");
+    expect(button("Send").disabled).toBe(true);
+    await press("Enter");
+    expect(calls("type")).toEqual([]);
+    expect(calls("submit")).toEqual([]);
+    expect(calls("draft")).toEqual([]);
+    await show({ item: item(), draft: { live: true, text: "" } });
+    await advance(1000);
+    expect(calls("draft")).toEqual([{ text: "fix the login" }]);
+    expect(area().value).toBe("fix the login");
+  });
+
+  test("a prompt typed before the pane is known can't be sent and survives an omp that connects straight away", async () => {
+    await show({ item: undefined, draft: null });
+    await input("fix the login");
+    expect(button("Send").disabled).toBe(true);
+    await press("Enter");
+    expect(calls("submit")).toEqual([]);
+    await show({ item: item(), draft: { live: true, text: "" } });
+    await advance(1000);
+    expect(calls("draft")).toEqual([{ text: "fix the login" }]);
+    expect(area().value).toBe("fix the login");
+  });
+
   test("a failed terminal write is shown but does not break subsequent queued input", async () => {
     await shell();
     net.reply = () => Response.json({ error: "pane closed" }, { status: 404 });
@@ -948,19 +975,24 @@ describe("stop, context and model controls", () => {
     expect(button("Send after this turn")).toBeDefined();
   });
 
-  test("context usage shows its window and compaction marker while clamping the fill", async () => {
-    await show({ item: item({ live: live({ context: { tokens: 150000, window: 200000, percent: 75, compactAt: 82.4 } }) }) });
-    expect(node(".ctx").title).toBe("75% of the context window · 150k tokens");
+  test("context usage shows its window, compaction tick and details, opened by a tap, while clamping the fill", async () => {
+    await show({ item: item({ live: live({}) }), context: { tokens: 150000, window: 200000, percent: 75, compactAt: 82.4 } });
+    expect([...root.querySelectorAll(".ctx-tip > *")].map((e) => e.textContent)).toEqual(["Context 75% used", "150K of 200K tokens", "Auto-compact at 82%"]);
     expect(node(".ctx-fill").style.width).toBe("75%");
     expect(node(".ctx-mark").style.left).toBe("82.4%");
-    expect(node(".ctx-mark").title).toBe("auto-compacts at 82%");
-    expect(node(".ctx-window").textContent).toBe("200k");
-    await show({ item: item({ live: live({ context: { tokens: 220000, window: 200000, percent: 110, compactAt: null } }) }) });
+    expect(node(".ctx-window").textContent).toBe("200K");
+    expect(node(".ctx").classList.contains("tip-open")).toBe(false);
+    await act(() => node(".ctx-hit").click());
+    expect(node(".ctx").classList.contains("tip-open")).toBe(true);
+    await act(() => node(".ctx-hit").click());
+    expect(node(".ctx").classList.contains("tip-open")).toBe(false);
+    await show({ context: { tokens: 220000, window: 200000, percent: 110, compactAt: null } });
     expect(node(".ctx").classList.contains("ctx-over")).toBe(true);
     expect(node(".ctx-fill").style.width).toBe("100%");
     expect(node(".ctx-pct").textContent).toBe("110%");
     expect(root.querySelector(".ctx-mark")).toBeNull();
-    await show({ item: item({ live: live({ context: { tokens: 0, window: 200000, percent: 0, compactAt: null } }) }) });
+    expect([...root.querySelectorAll(".ctx-tip > *")].map((e) => e.textContent)).toEqual(["Context 110% used", "220K of 200K tokens"]);
+    await show({ context: { tokens: 0, window: 200000, percent: 0, compactAt: null } });
     expect(node(".ctx-fill").style.width).toBe("1%");
   });
 

@@ -20,14 +20,15 @@ import { IMAGE_MIMES, TranscriptImages, readChatFile, recapStale, scanFacts, typ
 import { countSubagents, listSubagents, regularFile, subagentDir, subagentFile, validSubagentName, type Subagent, type SubagentFacts } from "./lib/subagents";
 import { readBtwHistory } from "./lib/btw-history";
 import { compactAtPercent, type Compaction } from "./lib/compaction";
-import { branchOf, projectOf } from "./lib/git";
-import { queryRecaps, querySessionRecaps, withRecaps } from "./lib/recaps";
+import { forgetRepos, repoOf } from "./lib/git";
+import { queryRecaps, querySessionRecaps, recapMark, withRecaps } from "./lib/recaps";
 import { answerSteps, KEYS, promptImages, type PromptImage } from "./lib/input";
-import { emptyState, listChanged, parseBridgeState, PROTOCOL, STRETCH_BLOCK, type BridgeState, type Caps, type Context, type Job } from "./lib/bridge-state";
+import { emptyState, listChanged, parseBridgeState, PROTOCOL, STRETCH_BLOCK, type BridgeState, type Caps, type ContextUse, type Job } from "./lib/bridge-state";
 import { extensionCheck, offersCommand, sessionMismatch, type InstallStatus, type Mismatch } from "./lib/extension-check";
 import { configDir, docIcon, installedExtension, ompDataDir, ternNotesDir } from "./lib/paths";
 import { ensureToken, sameToken } from "./lib/auth";
 import { recentProjects } from "./lib/projects";
+import { rowKeys, statePatch } from "./lib/state-patch";
 import { vapidSubject } from "./lib/push";
 import { writePrivateFile } from "./lib/private-file";
 
@@ -44,6 +45,8 @@ const PING_MS = 12_000;
 const TERN_EVENTS_RETRY_MS = 2000;
 const ROLES_TTL_MS = 5 * 60_000;
 const SCREEN_LINES = 160;
+/** Screen polls: shells echo typing, so they go faster than an omp's Raw screen. */
+const SCREEN_POLL_MS = { terminal: 450, agent: 1200 };
 const BRIDGE_REPLY_MS = 2000;
 /** A finish is reported only if the session stays idle this long (no follow-up turn). */
 const DONE_SETTLE_MS = 3000;
@@ -222,7 +225,13 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
    * (`tern send BLOCK keys Bogus`), so stderr counts too, minus its WARN noise.
    */
   async function tern(args: string[], timeoutMs = 10_000): Promise<{ out: string; error: string | null }> {
-    const proc = Bun.spawn(["tern", ...args], { env, stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+    let proc: Subprocess<"ignore", "pipe", "pipe">;
+    try {
+      proc = Bun.spawn(["tern", ...args], { env, stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+    } catch (err) {
+      // tern missing from PATH, or no processes left: a failed call, not a rejected promise callers would cache.
+      return { out: "", error: `tern ${args[0]}: ${err instanceof Error ? err.message : String(err)}` };
+    }
     const timer = setTimeout(() => proc.kill(), timeoutMs);
     const [out, err, code] = await Promise.all([
       new Response(proc.stdout).text(),
@@ -257,6 +266,17 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
 
   function emit(pane: string, event: string, data: unknown) {
     for (const fn of paneListeners.get(pane) ?? []) fn(event, data);
+  }
+
+  /** The context gauge: omp's usage and where auto-compaction fires; null without a bridge or a window. */
+  async function contextOf(b: Bridge | null | undefined): Promise<ContextUse | null> {
+    const context = b?.state.context;
+    return context ? { ...context, compactAt: compactAtPercent((await ompSettings()).compaction, context.window) } : null;
+  }
+
+  /** Sends a pane's gauge to its phones, unless another connection took the pane over meanwhile. */
+  function publishContext(pane: string, b: Bridge) {
+    void contextOf(b).then((context) => bridges.get(pane) === b && emit(pane, "context", context));
   }
 
   function notifyBridge(pane: string) {
@@ -338,12 +358,12 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
     }
   }
 
-  /** `omp config get KEY` as parsed JSON; null when omp is missing or the key is unset. */
-  async function ompConfig(key: string): Promise<unknown> {
+  /** omp's settings from `omp config list --json` ({key: {value, type}}; an unset key has no value); empty when omp is missing. */
+  async function ompConfig(): Promise<Obj> {
     try {
-      return JSON.parse((await commandOutput(["omp", "config", "get", key], 10_000)) ?? "");
+      return obj(JSON.parse((await commandOutput(["omp", "config", "list", "--json"], 10_000)) ?? ""));
     } catch {
-      return null;
+      return {};
     }
   }
 
@@ -351,22 +371,32 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
   type Role = { role: string; spec: string };
   type OmpSettings = { roles: Role[]; compaction: Compaction };
   let settingsCache: { at: number; value: Promise<OmpSettings> } | null = null;
+  /** The compaction settings last read; a change moves every open gauge's tick. */
+  let compactionSeen: string | null = null;
   /** The omp settings the list needs, read at most every few minutes; a missing omp only costs the picker and the gauge's tick. */
   function ompSettings(): Promise<OmpSettings> {
     if (settingsCache && Date.now() - settingsCache.at < ROLES_TTL_MS) return settingsCache.value;
-    const keys = ["modelRoles", "cycleOrder", "compaction.enabled", "compaction.thresholdTokens", "compaction.thresholdPercent", "compaction.reserveTokens"];
-    const value = Promise.all(keys.map(ompConfig)).then(([roles, order, enabled, tokens, percent, reserve]) => ({
-      roles: arr(order)
-        .map((r) => ({ role: str(r), spec: str(obj(roles)[str(r)]) }))
-        .filter((r) => r.role && r.spec),
-      compaction: {
-        enabled: enabled !== false,
-        thresholdTokens: num(tokens),
-        thresholdPercent: num(percent),
-        reserveTokens: typeof reserve === "number" ? reserve : null,
-      },
-    }));
+    const value = ompConfig().then((config) => {
+      const keys = ["modelRoles", "cycleOrder", "compaction.enabled", "compaction.thresholdTokens", "compaction.thresholdPercent", "compaction.reserveTokens"];
+      const [roles, order, enabled, tokens, percent, reserve] = keys.map((key) => obj(config[key]).value);
+      return {
+        roles: arr(order)
+          .map((r) => ({ role: str(r), spec: str(obj(roles)[str(r)]) }))
+          .filter((r) => r.role && r.spec),
+        compaction: {
+          enabled: enabled !== false,
+          thresholdTokens: num(tokens),
+          thresholdPercent: num(percent),
+          reserveTokens: typeof reserve === "number" ? reserve : null,
+        },
+      };
+    });
     settingsCache = { at: Date.now(), value };
+    void value.then((s) => {
+      const key = JSON.stringify(s.compaction);
+      if (compactionSeen !== null && key !== compactionSeen) for (const [pane, b] of bridges) if (paneListeners.has(pane)) publishContext(pane, b);
+      compactionSeen = key;
+    });
     return value;
   }
 
@@ -403,7 +433,6 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
       levels: string[];
       tiers: string[];
       tier: string;
-      context: (Context & { compactAt: number | null }) | null;
       jobs: Job[];
       /** The extension's bridge protocol (0: older than versioning) and its feature caps (null: none sent). */
       protocol: number;
@@ -417,6 +446,8 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
     } | null;
     /** working / blocked / idle, from the session's bridge; null without one. */
     status: string | null;
+    /** An omp pane whose omp hasn't connected to /bridge yet: it is still starting. */
+    starting: boolean;
     /** When `status` last changed (ms). */
     since: number;
     /** File blocks (Tern notes and opened files): the path shown read-only instead of a terminal. */
@@ -507,11 +538,34 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
         });
       }),
     );
+    // Entries of sessions no longer bridged go; these maps would otherwise keep every session the server saw.
+    const ids = new Set(connected.map(([, b]) => b.state.sessionId));
+    for (const id of sessionPaths.keys()) if (!ids.has(id)) sessionPaths.delete(id);
+    const transcripts = new Set(sessionPaths.values());
+    for (const path of factsCache.keys()) if (!transcripts.has(path)) factsCache.delete(path);
+    const dirs = new Set([...transcripts].map(subagentDir));
+    for (const path of subagentFacts.keys()) if (!dirs.has(dirname(path))) subagentFacts.delete(path);
     return byPane;
   }
 
+  /**
+   * `tern ls --json`, kept until Tern reports a change (`invalidateTree`) and for at most
+   * `STATE_TTL_MS`: bridge reports rebuild the list from it without running the CLI. A failed list
+   * isn't kept.
+   */
+  let treeCache: { at: number; value: Promise<{ out: string; error: string | null }> } | null = null;
+  function ternTree(): Promise<{ out: string; error: string | null }> {
+    if (treeCache && Date.now() - treeCache.at < STATE_TTL_MS) return treeCache.value;
+    const entry = { at: Date.now(), value: tern(["ls", "--json"]) };
+    treeCache = entry;
+    void entry.value.then((ls) => {
+      if (ls.error && treeCache === entry) treeCache = null;
+    });
+    return entry.value;
+  }
+
   async function buildState(): Promise<State> {
-    const [ls, agents, settings] = await Promise.all([tern(["ls", "--json"]), readAgents(), ompSettings()]);
+    const [ls, agents, settings] = await Promise.all([ternTree(), readAgents(), ompSettings()]);
     let tree: Obj = {};
     try {
       tree = obj(JSON.parse(ls.out));
@@ -520,75 +574,75 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
     const counts: Record<string, number> = { working: 0, blocked: 0, idle: 0 };
     // What a session's extension should be: this server's protocol and the checkout's file.
     const current = { protocol: PROTOCOL, build: extension.build() };
-    for (const s of arr(tree.sessions).map(obj))
-      for (const t of arr(s.tabs).map(obj))
-        for (const b of arr(t.blocks).map(obj)) {
-          const id = String(b.id);
-          const agent = agents.get(id) ?? null;
-          const bridge = bridges.get(id);
-          const cwd = str(b.cwd, HOME);
-          const file = str(b.file);
-          const note = /^note:([0-9a-f]+)$/.exec(file)?.[1];
-          const doc = note ? join(NOTES_DIR, `${note}.md`) : file && isAbsolute(file) ? file : null;
-          // Tern leaves file blocks untitled: name them after the file, with a file-type glyph.
-          const raw = str(b.title).trim() || (note ? "Note" : doc ? basename(doc) : basename(str(b.program, id)));
-          const icon = PUA.exec(raw)?.[0] ?? (doc ? docIcon(doc, !!note) : null);
-          const clean = raw.replace(new RegExp(PUA.source, "gu"), "").trim();
-          const m = /^([\p{Lu}\d_-]{2,14}):\s+(.*)$/u.exec(clean);
-          const project = projectOf(cwd, HOME);
-          const status = bridge?.state.status || null;
-          // The bridge's clock starts at its connect; an idle session dates from its last entry.
-          const since = status === "idle" && agent?.lastActivity ? agent.lastActivity : (bridge?.state.since ?? 0);
-          if (status) counts[status] = (counts[status] ?? 0) + 1;
-          // A bridge that hasn't reported yet (no status) has nothing to compare.
-          const mismatch = bridge?.state.status ? sessionMismatch(bridge.state, current) : null;
-          if (bridge && mismatch === "older") askRestart(bridge);
-          const list = groups.get(project) ?? [];
-          list.push({
-            block: id,
-            icon,
-            tag: m ? m[1] : null,
-            title: m ? m[2] : clean,
-            cwd,
-            project,
-            branch: doc ? null : branchOf(cwd),
-            agent,
-            live: bridge
-              ? {
-                  model: bridge.state.model,
-                  thinking: bridge.state.thinking,
-                  levels: bridge.state.levels,
-                  tiers: bridge.state.tiers,
-                  tier: bridge.state.tier,
-                  context: bridge.state.context && { ...bridge.state.context, compactAt: compactAtPercent(settings.compaction, bridge.state.context.window) },
-                  jobs: bridge.state.jobs,
-                  protocol: bridge.state.protocol,
-                  caps: bridge.state.caps,
-                  build: bridge.state.build,
-                  mismatch,
-                  restart: bridge.restart === true,
-                }
-              : null,
-            status,
-            since,
-            doc,
-            unseen: unseen.get(id) ?? null,
-          });
-          groups.set(project, list);
-        }
+    const blocks = arr(tree.sessions).flatMap((s) => arr(obj(s).tabs).flatMap((t) => arr(obj(t).blocks).map(obj)));
+    // Every distinct cwd at once; only a cwd seen for the first time waits for git.
+    const cwds = [...new Set(blocks.map((b) => str(b.cwd, HOME)))];
+    const repos = new Map(await Promise.all(cwds.map((cwd) => repoOf(cwd, HOME, invalidateState).then((r) => [cwd, r] as const))));
+    for (const b of blocks) {
+      const id = String(b.id);
+      const agent = agents.get(id) ?? null;
+      const bridge = bridges.get(id);
+      const cwd = str(b.cwd, HOME);
+      const file = str(b.file);
+      const note = /^note:([0-9a-f]+)$/.exec(file)?.[1];
+      const doc = note ? join(NOTES_DIR, `${note}.md`) : file && isAbsolute(file) ? file : null;
+      // Tern leaves file blocks untitled: name them after the file, with a file-type glyph.
+      const raw = str(b.title).trim() || (note ? "Note" : doc ? basename(doc) : basename(str(b.program, id)));
+      const icon = PUA.exec(raw)?.[0] ?? (doc ? docIcon(doc, !!note) : null);
+      const clean = raw.replace(new RegExp(PUA.source, "gu"), "").trim();
+      const m = /^([\p{Lu}\d_-]{2,14}):\s+(.*)$/u.exec(clean);
+      const { project, branch } = repos.get(cwd)!;
+      const status = bridge?.state.status || null;
+      // The bridge's clock starts at its connect; an idle session dates from its last entry.
+      const since = status === "idle" && agent?.lastActivity ? agent.lastActivity : (bridge?.state.since ?? 0);
+      if (status) counts[status] = (counts[status] ?? 0) + 1;
+      // A bridge that hasn't reported yet (no status) has nothing to compare.
+      const mismatch = bridge?.state.status ? sessionMismatch(bridge.state, current) : null;
+      if (bridge && mismatch === "older") askRestart(bridge);
+      const list = groups.get(project) ?? [];
+      list.push({
+        block: id,
+        icon,
+        tag: m ? m[1] : null,
+        title: m ? m[2] : clean,
+        cwd,
+        project,
+        branch: doc ? null : branch,
+        agent,
+        live: bridge
+          ? {
+              model: bridge.state.model,
+              thinking: bridge.state.thinking,
+              levels: bridge.state.levels,
+              tiers: bridge.state.tiers,
+              tier: bridge.state.tier,
+              jobs: bridge.state.jobs,
+              protocol: bridge.state.protocol,
+              caps: bridge.state.caps,
+              build: bridge.state.build,
+              mismatch,
+              restart: bridge.restart === true,
+            }
+          : null,
+        status,
+        starting: !bridge && b.exited == null && /^omp(\s|$)/.test(str(b.command)),
+        since,
+        doc,
+        unseen: unseen.get(id) ?? null,
+      });
+      groups.set(project, list);
+    }
     // A successful empty list means the last pane closed; a failed or malformed list proves nothing.
     const open = new Set([...groups.values()].flatMap((items) => items.map((i) => i.block)));
-    if (!ls.error && Array.isArray(tree.sessions))
+    if (!ls.error && Array.isArray(tree.sessions)) {
       for (const pane of unseen.keys()) if (!open.has(pane)) unseen.delete(pane);
+      forgetRepos(new Set(cwds));
+    }
     // Newest activity first, within projects and between them.
     const activity = (i: Item) => i.since;
     const projects = [...groups].map(([name, items]) => ({ name, items: items.sort((x, y) => activity(y) - activity(x)) }));
     projects.sort((x, y) => activity(y.items[0]) - activity(x.items[0]));
-    // dist/'s build id: "" until `bun run build` has run.
-    let app = "";
-    try {
-      app = readFileSync(join(DIST, "build-id"), "utf8").trim();
-    } catch {}
+    const app = buildId();
     return {
       projects,
       counts,
@@ -600,10 +654,41 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
     };
   }
 
+  /** dist/'s build id, "" until `bun run build` has run; reread only when the file's stamp changes (a stat, no read, per request). */
+  let buildIdCache = { stamp: "", id: "" };
+  function buildId(): string {
+    const st = statSync(join(DIST, "build-id"), { throwIfNoEntry: false });
+    const stamp = st ? `${st.ino}:${st.size}:${st.mtimeMs}` : "";
+    if (stamp !== buildIdCache.stamp) {
+      let id = "";
+      try {
+        id = st ? readFileSync(join(DIST, "build-id"), "utf8").trim() : "";
+      } catch {}
+      buildIdCache = { stamp, id };
+    }
+    return buildIdCache.id;
+  }
+
   let stateCache: { at: number; value: Promise<State> } | null = null;
   function getState(): Promise<State> {
     if (!stateCache || Date.now() - stateCache.at > STATE_TTL_MS) stateCache = { at: Date.now(), value: buildState() };
     return stateCache.value;
+  }
+  type StateView = { key: string; order: [string, string[]][]; rows: Map<string, string> };
+  const stateViews = new WeakMap<State, StateView>();
+  /**
+   * What a stream compares to skip an unchanged list (`at` aside), the row order and each row's
+   * serialised form for patches; worked out once per built state, not per stream.
+   */
+  function stateView(s: State): StateView {
+    let view = stateViews.get(s);
+    if (!view) {
+      const rows = rowKeys(s);
+      const order: [string, string[]][] = s.projects.map((p) => [p.name, p.items.map((i) => i.block)]);
+      view = { rows, order, key: `${JSON.stringify([order, s.counts, s.roles, s.extension, s.badge, s.app])}\0${[...rows.values()].join("\0")}` };
+      stateViews.set(s, view);
+    }
+    return view;
   }
 
   /** Open streams, each rechecking the list (and its block) when called. */
@@ -619,7 +704,12 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
       for (const fn of stateWatchers) fn();
     }, STATE_BATCH_MS);
   }
-  const safety = setInterval(() => stateWatchers.size && invalidateState(), SAFETY_MS);
+  /** Tern's own blocks may have changed (opened, closed, moved, retitled): `tern ls` runs again too. */
+  function invalidateTree() {
+    treeCache = null;
+    invalidateState();
+  }
+  const safety = setInterval(() => stateWatchers.size && invalidateTree(), SAFETY_MS);
 
   /** The running `tern events`, killed by `stop`. */
   let ternEvents: Subprocess | null = null;
@@ -647,7 +737,7 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
               event = str(obj(JSON.parse(line)).event);
             } catch {}
             // Every CLI call (this server's own `tern ls` and `capture` too) logs a client pair.
-            if (event && !event.startsWith("client_")) invalidateState();
+            if (event && !event.startsWith("client_")) invalidateTree();
           }
         }
         await proc.exited;
@@ -667,10 +757,23 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
   }
   const following = followTernEvents();
 
-  // omp writes a recap to history.db when a session goes idle, after the status change.
+  // omp writes a recap to history.db when a session goes idle, after the status change. It writes
+  // there after every prompt too (prompt history): only a change in the recaps rebuilds the list.
+  let recapsSeen = fromHistory(recapMark, "");
+  let recapTimer: Timer | null = null;
   let historyWatcher: FSWatcher | null = null;
   try {
-    historyWatcher = watch(dirname(HISTORY_DB), (_e, f) => f?.startsWith("history.db") && invalidateState());
+    historyWatcher = watch(dirname(HISTORY_DB), (_e, f) => {
+      if (!f?.startsWith("history.db") || recapTimer) return;
+      // One look per burst of writes (the db, its -wal and -shm), once they have landed.
+      recapTimer = setTimeout(() => {
+        recapTimer = null;
+        const mark = fromHistory(recapMark, "");
+        if (mark === recapsSeen) return;
+        recapsSeen = mark;
+        invalidateState();
+      }, STATE_BATCH_MS);
+    });
     historyWatcher.on("error", () => {});
   } catch {}
   // `bun run build` swaps dist/ in with a rename: open pages learn the new id and reload.
@@ -705,14 +808,28 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
     return null;
   }
 
-  async function readChat(sessionId: string, limit: number): Promise<{ entries: ChatEntry[] } | null> {
+  /** A session's chat as parsed from its transcript, with recaps; local images not yet attached. */
+  async function parseSessionChat(sessionId: string, limit: number): Promise<{ entries: ChatEntry[] } | null> {
     const path = transcriptPath(sessionId);
     if (!path) return null;
     // The session's own leaf: its bridge knows it even before anything is appended after a rewind.
     const leaf = [...bridges.values()].find((b) => b.state.sessionId === sessionId)?.state.leaf ?? "";
     const chat = await readChatFile(path, leaf, limit);
     const recaps = fromHistory((db) => querySessionRecaps(db, sessionId), []);
-    return transcriptImages.attach({ entries: withRecaps(chat.entries, recaps) });
+    return { entries: withRecaps(chat.entries, recaps) };
+  }
+
+  /**
+   * Local images go onto a copy of each entry: a shared parse stays image-free, and every delivery
+   * rechecks the image files (one overwritten in place gets its new hash).
+   */
+  function withImages(chat: { entries: ChatEntry[] }): Promise<{ entries: ChatEntry[] }> {
+    return transcriptImages.attach({ entries: chat.entries.map((e) => ({ ...e })) });
+  }
+
+  async function readChat(sessionId: string, limit: number): Promise<{ entries: ChatEntry[] } | null> {
+    const chat = await parseSessionChat(sessionId, limit);
+    return chat && withImages(chat);
   }
 
   const subagentFacts = new Map<string, SubagentFacts>();
@@ -733,17 +850,45 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
     return { text: out.replace(/\s+$/, "").split("\n").slice(-SCREEN_LINES).join("\n"), html: false };
   }
 
+  /**
+   * The newest read of each transcript or screen, shared by every stream showing it: a read is
+   * reused while its `tag` (the file's stamp, or the screen's time slot) holds. The oldest of more
+   * than 32 entries goes; a failed read isn't kept.
+   */
+  const sharedReads = new Map<string, { tag: string; value: Promise<unknown> }>();
+  function sharedRead<T>(key: string, tag: string, read: () => Promise<T>): Promise<T> {
+    const hit = sharedReads.get(key);
+    if (hit?.tag === tag) return hit.value as Promise<T>;
+    const value = read();
+    sharedReads.delete(key);
+    sharedReads.set(key, { tag, value });
+    if (sharedReads.size > 32) sharedReads.delete(sharedReads.keys().next().value!);
+    value.catch(() => sharedReads.get(key)?.value === value && sharedReads.delete(key));
+    return value;
+  }
+
+  /** Input changes the screen: the next poll captures it again instead of reusing this slot's capture. */
+  function forgetScreen(block: string) {
+    sharedReads.delete(`screen:${block}:true`);
+    sharedReads.delete(`screen:${block}:false`);
+  }
+
   // ---------- input ----------
 
   async function sendKeys(block: string, keys: string[]): Promise<string | null> {
     const bad = keys.find((k) => KEYS[k] !== true);
     if (bad !== undefined) return `key not allowed: ${bad}`;
-    return keys.length ? (await tern(["send", block, "keys", ...keys])).error : null;
+    if (!keys.length) return null;
+    const { error } = await tern(["send", block, "keys", ...keys]);
+    forgetScreen(block);
+    return error;
   }
 
   async function sendText(block: string, text: string): Promise<string | null> {
     // `--` so text starting with `-` (`--help`, `-h`) is typed, not read as tern's own flags.
-    return (await tern(["send", block, text.includes("\n") ? "paste" : "text", "--", text])).error;
+    const { error } = await tern(["send", block, text.includes("\n") ? "paste" : "text", "--", text]);
+    forgetScreen(block);
+    return error;
   }
 
   /**
@@ -842,6 +987,10 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
             onPane("draft", draftPayload(b));
             if (b?.live) onPane("live", b.live);
             if (b?.state.queued.length) onPane("queued", b.state.queued);
+            // Always, null included: what the turn is doing, or nothing once it ended while away.
+            onPane("run", b?.state.run ?? null);
+            // Always, null included: the gauge comes only as this event, not in the list.
+            void contextOf(b).then((context) => (bridges.get(block) ?? null) === b && onPane("context", context));
             // Always, null included: a reconnecting phone must drop state from an omp that restarted without stretch.ts.
             onPane("stretch", b?.state.stretch ?? null);
             // Opening a session on the phone is seeing its update.
@@ -849,6 +998,8 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
           }
 
           let lastState = "";
+          /** The rows this stream sent last; after the first full `state`, only changed rows go (`patch`). */
+          let lastRows: Map<string, string> | null = null;
           let lastDetail = "";
           let timer: Timer | undefined;
           let followed: { path: string; watcher: FSWatcher } | null = null;
@@ -880,10 +1031,12 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
 
           const step = async () => {
             const s = await getState();
-            const key = JSON.stringify([s.projects, s.counts, s.roles, s.extension, s.badge, s.app]);
-            if (key !== lastState) {
-              lastState = key;
-              send("state", s);
+            const list = stateView(s);
+            if (list.key !== lastState) {
+              lastState = list.key;
+              if (lastRows) send("patch", statePatch(s, list.order, list.rows, lastRows));
+              else send("state", s);
+              lastRows = list.rows;
             }
             const item = block ? await findItem(block) : undefined;
             if (stop) return;
@@ -907,7 +1060,7 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
                 const etag = st ? `${file}:${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}` : "none";
                 if (etag !== lastDetail) {
                   // No bridge speaks for a subagent: its file's last entry is its leaf.
-                  const chat = file ? await transcriptImages.attach(await readChatFile(file, "", 80)) : { entries: [] };
+                  const chat = file ? await withImages(await sharedRead(`chat:${file}`, etag, () => readChatFile(file, "", 80))) : { entries: [] };
                   lastDetail = etag;
                   send("chat", chat);
                 }
@@ -929,21 +1082,26 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
               // The recap: omp writes it to history.db once the session sat idle, with the transcript unchanged.
               const etag = st ? `${path}:${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}:${bridges.get(block!)?.state.leaf ?? ""}:${item.agent.recap}` : "none";
               if (etag !== lastDetail) {
-                const chat = await readChat(item.agent.sessionId, 80);
+                const sessionId = item.agent.sessionId;
+                // Keyed by session: sessions without a transcript yet all have no path.
+                const parsed = await sharedRead(`chat:session:${sessionId}`, etag, () => parseSessionChat(sessionId, 80));
+                const chat = parsed && (await withImages(parsed));
                 lastDetail = etag;
                 send("chat", chat);
               }
             } else {
               follow(null);
               if (!item) return;
-              const screen = await readScreen(item.block, item.agent !== null || item.live !== null);
+              const agent = item.agent !== null || item.live !== null;
+              const every = agent ? SCREEN_POLL_MS.agent : SCREEN_POLL_MS.terminal;
+              // Polls land on slot boundaries, so every phone on this block shares one capture per slot.
+              const slot = String(Math.floor(Date.now() / every));
+              const screen = await sharedRead(`screen:${item.block}:${agent}`, slot, () => readScreen(item.block, agent));
               if (screen.text !== lastDetail) {
                 lastDetail = screen.text;
                 send("screen", screen);
               }
-              // Terminals echo typing; poll them fast so the phone keeps up.
-              const terminal = !item.agent && !item.live;
-              if (!stop) timer = setTimeout(check, terminal ? 450 : 1200);
+              if (!stop) timer = setTimeout(check, every - (Date.now() % every) + 5);
             }
           };
 
@@ -1107,7 +1265,7 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
         case "close": {
           // Closes the block in Tern itself, so on the desktop too; the phone confirms first.
           const err = (await tern(["close", block])).error;
-          invalidateState();
+          invalidateTree();
           return done(err);
         }
         case "keys":
@@ -1212,7 +1370,7 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
         return json({ error: "cwd must be an existing directory" }, 400);
       const r = await tern(["new", "tab", "--cwd", cwd, "--json", "--", "omp"]);
       if (r.error) return json({ error: r.error }, 502);
-      invalidateState();
+      invalidateTree();
       try {
         return json({ block: String(obj(JSON.parse(r.out)).block) });
       } catch {
@@ -1241,7 +1399,9 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
     doneTimers.delete(pane);
     emit(pane, "live", { text: "", done: false });
     emit(pane, "queued", []);
+    emit(pane, "run", null);
     emit(pane, "stretch", null);
+    emit(pane, "context", null);
   }
 
   /** A connection stopped speaking for its pane: its pending requests fail now, not at their timeout. */
@@ -1292,7 +1452,8 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
       next.send(JSON.stringify({ t: "sync" }));
       return;
     }
-    invalidateState();
+    // The pane's omp exited or crashed: `tern ls` tells whether the block is gone or still starting.
+    invalidateTree();
     notifyBridge(pane);
   }
 
@@ -1309,6 +1470,7 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
     for (const finish of [...openStreams]) finish();
     await server?.stop(true);
     clearTimeout(stateTimer ?? undefined);
+    clearTimeout(recapTimer ?? undefined);
     historyDb?.close();
     await following;
   }
@@ -1332,13 +1494,37 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
         if (url.pathname.startsWith("/api/")) return handleApi(req, url);
         const rel = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
         if (rel.includes("..")) return new Response("bad path", { status: 400 });
-        const file = Bun.file(join(DIST, rel));
         const index = Bun.file(join(DIST, "index.html"));
         if (!(await index.exists())) return new Response("not built: run `bun run build`", { status: 404 });
-        return new Response((await file.exists()) ? file : index, {
-          // The 1 MB symbols font changes only with the Nerd Font package.
-          headers: { "cache-control": rel === "symbols.woff2" ? "max-age=604800" : "no-cache", "content-security-policy": CSP },
+        const found = Bun.file(join(DIST, rel));
+        // Client-side routes get the app.
+        const name = (await found.exists()) ? rel : "index.html";
+        const file = name === rel ? found : index;
+        // build.ts writes `<file>.br` beside each text file; neither Bun.serve nor tailscale serve compresses.
+        // `br;q=0` is a refusal.
+        const takesBr = (req.headers.get("accept-encoding") ?? "").split(",").some((entry) => {
+          const [coding, ...params] = entry.split(";").map((p) => p.trim().toLowerCase());
+          const q = params.find((p) => p.startsWith("q="));
+          return coding === "br" && (!q || Number(q.slice(2)) > 0);
         });
+        const br = takesBr ? Bun.file(join(DIST, `${name}.br`)) : null;
+        const body = br && (await br.exists()) ? br : file;
+        const headers: Record<string, string> = { "content-type": file.type, vary: "accept-encoding", "content-security-policy": CSP };
+        if (body !== file) headers["content-encoding"] = "br";
+        // Chunks are named by their content: a new build gets new names.
+        if (/^chunk-[a-z0-9]+\.js$/.test(name)) headers["cache-control"] = "public, max-age=31536000, immutable";
+        // The 1 MB symbols font changes only with the Nerd Font package.
+        else if (name === "symbols.woff2") headers["cache-control"] = "max-age=604800";
+        else {
+          headers["cache-control"] = "no-cache";
+          // The build id hashes every file in dist/: an unchanged build answers a revalidation with 304.
+          const id = buildId();
+          if (id) {
+            headers.etag = `"${id}${body === file ? "" : "-br"}"`;
+            if (req.headers.get("if-none-match") === headers.etag) return new Response(null, { status: 304, headers });
+          }
+        }
+        return new Response(body, { headers });
       },
       websocket: {
         message(ws, raw) {
@@ -1389,10 +1575,18 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
             resetPane(pane);
           }
           if ((changedSession || status === "working") && unseen.delete(pane)) invalidateState();
-          // A rewind moves the leaf without writing to the file: the open chat must re-read.
-          if (before.leaf !== b.state.leaf) emit(pane, "leaf", null);
+          // A rewind moves the leaf without writing to the file: the open chat must re-read. A new
+          // entry moves it too, and the row's last prompt and time come from the transcript.
+          if (before.leaf !== b.state.leaf) {
+            emit(pane, "leaf", null);
+            invalidateState();
+          }
           if (JSON.stringify(before.queued) !== JSON.stringify(b.state.queued)) emit(pane, "queued", b.state.queued);
+          if (JSON.stringify(before.run) !== JSON.stringify(b.state.run)) emit(pane, "run", b.state.run);
           if (JSON.stringify(before.stretch) !== JSON.stringify(b.state.stretch)) emit(pane, "stretch", b.state.stretch);
+          // The gauge moves every 2 s while omp works: it goes to that pane's phones, without rebuilding the list.
+          // A new session's reset cleared it, so it goes again even when the numbers match.
+          if (changedSession || JSON.stringify(before.context) !== JSON.stringify(b.state.context)) publishContext(pane, b);
           if (listChanged(before, b.state)) invalidateState();
           // `before.status` is empty on a fresh connection: a restarted omp is not a finished turn.
           if (!changedSession && before.status && before.status !== status) onStatusChange(pane, before.status, status, b.state.sessionId);

@@ -22,6 +22,8 @@ export type BridgeState = {
   queued: Queued[];
   /** Background jobs running for the session: subagents (`task`, `eval`) and backgrounded bash. */
   jobs: Job[];
+  /** The running turn as omp's working row shows it; null when idle or from older extensions. */
+  run: Run | null;
   /** The session's current leaf entry: after a rewind it sits earlier than the file's last line. */
   leaf: string;
   /** The current model's thinking levels ("off" first) and serving tiers ("" = standard). */
@@ -50,14 +52,18 @@ export type StretchState = {
   running: Record<string, { key: string; seconds: number; partial: string }[]>;
 };
 export type Context = { tokens: number; window: number; percent: number };
+/** The context gauge as phones get it (`context` stream event); `compactAt`: percent of the window where omp auto-compacts, null when off. */
+export type ContextUse = Context & { compactAt: number | null };
 type Queued = { text: string; followUp: boolean };
+/** `since`: when the turn started (ms); `intent`: what its current tool call does, "" before the first. */
+export type Run = { since: number; intent: string };
 export type Job = { id: string; type: string; label: string; agent: string; since: number };
 const CAPS = ["models", "tiers", "jobs", "queue", "rewind", "btw", "complete", "levels"] as const;
 export type Caps = Record<(typeof CAPS)[number], boolean>;
 
 /** A connection that hasn't reported yet. */
 export function emptyState(now: number): BridgeState {
-  return { sessionId: "", text: "", model: "", thinking: "", status: "", since: now, context: null, queued: [], jobs: [], leaf: "", levels: [], tiers: [], tier: "", protocol: 0, build: "", caps: null, stretch: null };
+  return { sessionId: "", text: "", model: "", thinking: "", status: "", since: now, context: null, queued: [], jobs: [], run: null, leaf: "", levels: [], tiers: [], tier: "", protocol: 0, build: "", caps: null, stretch: null };
 }
 
 /** The reported caps; a cap the extension doesn't name (or names oddly) is unsupported. */
@@ -106,6 +112,7 @@ export function parseBridgeState(msg: Obj, before: BridgeState, now: number): Br
   const status = str(msg.status) || (msg.idle === false ? "working" : "idle");
   const c = obj(msg.context);
   const window = num(c.window);
+  const run = obj(msg.run);
   return {
     sessionId: str(msg.sessionId),
     text: str(msg.text),
@@ -125,6 +132,7 @@ export function parseBridgeState(msg: Obj, before: BridgeState, now: number): Br
       .map(obj)
       .map((j) => ({ id: str(j.id), type: str(j.type), label: str(j.label), agent: str(j.agent), since: num(j.since) }))
       .filter((j) => j.id),
+    run: num(run.since) > 0 ? { since: num(run.since), intent: str(run.intent).slice(0, 120) } : null,
     leaf: str(msg.leaf),
     protocol: num(msg.protocol),
     build: str(msg.build),
@@ -133,16 +141,13 @@ export function parseBridgeState(msg: Obj, before: BridgeState, now: number): Br
   };
 }
 
-/** Whether the change shows in the list (a draft or queue change alone doesn't). */
+/** Whether the change shows in the list (a draft, the queue or the context gauge alone doesn't). */
 export function listChanged(before: BridgeState, after: BridgeState): boolean {
   return (
     before.model !== after.model ||
     before.thinking !== after.thinking ||
     before.tier !== after.tier ||
     before.status !== after.status ||
-    before.context?.percent !== after.context?.percent ||
-    before.context?.tokens !== after.context?.tokens ||
-    before.context?.window !== after.context?.window ||
     before.sessionId !== after.sessionId ||
     before.protocol !== after.protocol ||
     before.build !== after.build ||
