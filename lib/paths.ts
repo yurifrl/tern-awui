@@ -2,7 +2,7 @@
 // environment, home and platform so tests can ask about any OS from any OS.
 
 import { existsSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 type Env = Record<string, string | undefined>;
 
@@ -36,6 +36,17 @@ export function ompDataDir(env: Env, home: string, platform: NodeJS.Platform, ex
  */
 export function installedExtension(env: Env, home: string): string {
   return join(env.TERN_AWUI_OMP_DIR ? resolve(env.TERN_AWUI_OMP_DIR) : join(home, ".omp", "agent"), "extensions", "tern-mobile.ts");
+}
+
+/**
+ * Where omp loads tern-mobile when it ships as an omp plugin dependency instead of an
+ * extensions-dir file: the package's copy under `<omp>/plugins/node_modules/tern-mobile`, a
+ * sibling of the agent dir. omp reads the package's `omp.extensions` manifest there, so a
+ * `file:` dep in ~/.omp/plugins/package.json needs no file in extensions/. `$TERN_AWUI_OMP_DIR`
+ * keeps naming the agent dir, as for `installedExtension`.
+ */
+export function installedPluginCopy(env: Env, home: string): string {
+  return join(dirname(dirname(dirname(installedExtension(env, home)))), "plugins", "node_modules", "tern-mobile", "tern-mobile.ts");
 }
 
 /**

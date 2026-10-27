@@ -25,7 +25,7 @@ import { queryRecaps, querySessionRecaps, recapMark, withRecaps } from "./lib/re
 import { answerSteps, KEYS, promptImages, type PromptImage } from "./lib/input";
 import { emptyState, listChanged, parseBridgeState, PROTOCOL, STRETCH_BLOCK, type BridgeState, type Caps, type ContextUse, type Job } from "./lib/bridge-state";
 import { extensionCheck, offersCommand, sessionMismatch, type InstallStatus, type Mismatch } from "./lib/extension-check";
-import { configDir, docIcon, installedExtension, ompDataDir, ternNotesDir } from "./lib/paths";
+import { configDir, docIcon, installedExtension, installedPluginCopy, ompDataDir, ternNotesDir } from "./lib/paths";
 import { ensureToken, sameToken } from "./lib/auth";
 import { recentProjects } from "./lib/projects";
 import { rowKeys, statePatch } from "./lib/state-patch";
@@ -103,7 +103,9 @@ export function startServer(options: ServerOptions = {}): ServerHandle {
 
   /** Where omp loads the extension from, and the checkout's file it should be (or link to). */
   const INSTALLED_EXTENSION = installedExtension(env, HOME);
-  const extension = extensionCheck(INSTALLED_EXTENSION, join(REPO, "omp-extension", "tern-mobile.ts"));
+  /** omp's packaged copy under ~/.omp/plugins/node_modules: what it loads when the file above is absent. */
+  const PLUGIN_COPY = installedPluginCopy(env, HOME);
+  const extension = extensionCheck(INSTALLED_EXTENSION, join(REPO, "omp-extension", "tern-mobile.ts"), PLUGIN_COPY);
 
   const BRIDGE_TOKEN = ensureToken(join(CONFIG_DIR, "bridge-token"));
   /** Set by `stop`: background loops and late callbacks end. */

@@ -51,6 +51,17 @@ export function classifyInstall(installed: string, source: string): Install {
   }
 }
 
+/**
+ * The extensions-dir file omp loads when it exists; else — omp shipping tern-mobile as a plugin
+ * dependency — the package's own copy, judged against the same source. omp resolves symlinks, so
+ * every status transfers: a copy linking another checkout is foreign, a dangling one is missing.
+ */
+function classifyAny(installed: string, source: string, pluginCopy: string): Install {
+  const file = classifyInstall(installed, source);
+  if (file.status !== "missing" || !pluginCopy) return file;
+  return classifyInstall(pluginCopy, source);
+}
+
 /** A file's change marker: its inode, mtime and size; "" when it doesn't exist. */
 function marker(path: string, follow: boolean): string {
   try {
@@ -63,15 +74,18 @@ function marker(path: string, follow: boolean): string {
 
 /**
  * The installed file's status and the checkout's build id, each recomputed only when the files
- * behind it change (inode, mtime, size), so the list can recheck them on every rebuild.
+ * behind it change (inode, mtime, size), so the list can recheck them on every rebuild. When the
+ * extensions-dir file is absent, the packaged copy omp loads as a plugin dependency
+ * (`pluginCopy`) stands in — see `classifyAny`.
  */
-export function extensionCheck(installed: string, source: string) {
+export function extensionCheck(installed: string, source: string, pluginCopy = "") {
   let install = { key: "-", value: { status: "missing", target: "" } as Install };
   let build = { key: "-", value: "" };
   return {
     install(): Install {
-      const key = `${marker(installed, false)}|${marker(installed, true)}|${marker(source, true)}`;
-      if (key !== install.key) install = { key, value: classifyInstall(installed, source) };
+      const plugin = pluginCopy ? `${marker(pluginCopy, false)}|${marker(pluginCopy, true)}` : "-";
+      const key = `${marker(installed, false)}|${marker(installed, true)}|${marker(source, true)}|${plugin}`;
+      if (key !== install.key) install = { key, value: classifyAny(installed, source, pluginCopy) };
       return install.value;
     },
     build(): string {

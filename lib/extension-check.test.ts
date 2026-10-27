@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { buildId, classifyInstall, extensionCheck, offersCommand, sessionMismatch } from "./extension-check";
 
 let dir: string;
@@ -95,6 +95,32 @@ describe("extensionCheck", () => {
     expect(check.build()).toBe(buildId(readFileSync(source)));
     rmSync(source);
     expect(check.build()).toBe("");
+  });
+
+  test("without an extensions-dir file, omp's plugin-package copy stands in", () => {
+    const copy = join(dir, "plugins", "node_modules", "tern-mobile", "tern-mobile.ts");
+    mkdirSync(dirname(copy), { recursive: true });
+    const check = extensionCheck(installed, source, copy);
+    expect(check.install().status).toBe("missing");
+    writeFileSync(copy, readFileSync(source));
+    utimesSync(copy, T, T);
+    expect(check.install().status).toBe("ok");
+    writeFileSync(source, "// pulled\nexport default function ternMobile() {}\n");
+    expect(check.install().status).toBe("stale");
+    // An extensions-dir file, when present, wins over the plugin copy.
+    writeFileSync(installed, readFileSync(source));
+    utimesSync(installed, T, T);
+    expect(check.install().status).toBe("ok");
+  });
+
+  test("a foreign plugin copy reports where it points once the extensions-dir file is missing", () => {
+    const copy = join(dir, "plugins", "node_modules", "tern-mobile", "tern-mobile.ts");
+    mkdirSync(dirname(copy), { recursive: true });
+    symlinkSync(join(dir, "elsewhere.ts"), copy);
+    const check = extensionCheck(installed, source, copy);
+    expect(check.install().status).toBe("missing");
+    writeFileSync(join(dir, "elsewhere.ts"), readFileSync(source));
+    expect(check.install().status).toBe("foreign");
   });
 });
 
