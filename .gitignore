@@ -3,3 +3,4 @@ dist/
 .scratch/
 .dist-*/
 CLAUDE.md
+.worktrees/
